@@ -12,7 +12,7 @@
 
 id = "chenydev/headroom"
 name = "Headroom"
-version = "0.4.0"
+version = "0.4.1"
 plugin_api = 43
 author = "chenydev"
 license = "MIT"
@@ -149,12 +149,23 @@ entry = "bar.luau"
   type = "select"
   label_key = "settings.window.label"
   description_key = "settings.window.description"
-  default = "tightest"
+  default = "cycle"
   options = [
+    { value = "cycle", label_key = "settings.window.option.cycle" },
     { value = "tightest", label_key = "settings.window.option.tightest" },
     { value = "session", label_key = "settings.window.option.session" },
     { value = "weekly", label_key = "settings.window.option.weekly" },
   ]
+
+  [[widget.setting]]
+  key = "cycle_seconds"
+  type = "int"
+  label_key = "settings.cycle_seconds.label"
+  description_key = "settings.cycle_seconds.description"
+  default = 8
+  min = 3
+  max = 120
+  visible_when = { key = "window", values = ["cycle"] }
 
   [[widget.setting]]
   key = "bar_style"

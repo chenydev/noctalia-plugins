@@ -152,21 +152,41 @@ local function isShown(account): boolean
   return account.phase ~= "signed_out" and account.duplicateOf == nil
 end
 
+-- Resolves "cycle" into either "session" or "weekly" based on wall-clock phase
+-- so every provider in the bar switches cleanly in sync.
+function M.effectiveWindowPref(windowPref: string, now: number, cycleSeconds: number?): string
+  if windowPref ~= "cycle" then
+    return windowPref
+  end
+  local period = math.clamp(math.floor(cycleSeconds or 8), 3, 120)
+  return if math.floor(now / period) % 2 == 0 then "session" else "weekly"
+end
+
 -- What a bar capsule shows: a list of { provider, account, name, window? },
 -- in display order.
 --   shown(id):    whether the user wants this provider in the bar
---   windowPref:   "tightest" | "session" | "weekly"
+--   windowPref:   "cycle" | "tightest" | "session" | "weekly"
 --   maxItems:     when more match, the most urgent ones are kept
 --                 (forecast-aware severity first, then usage)
 --   allAccounts:  every signed-in account, or one per provider: the default,
 --                 else the first signed-in one
-function M.barItems(report, shown: (string) -> boolean, windowPref: string, maxItems: number, now: number, allAccounts: boolean?): { any }
+--   cycleSeconds: alternation period in seconds when windowPref == "cycle"
+function M.barItems(
+  report,
+  shown: (string) -> boolean,
+  windowPref: string,
+  maxItems: number,
+  now: number,
+  allAccounts: boolean?,
+  cycleSeconds: number?
+): { any }
+  local resolvedPref = M.effectiveWindowPref(windowPref, now, cycleSeconds)
   local items = {}
   for _, provider in (if type(report) == "table" and report.providers then report.providers else {}) do
     if shown(provider.id) then
       for _, account in provider.accounts do
         if isShown(account) then
-          local window = model.pick(account.snapshot and account.snapshot.windows or {}, windowPref)
+          local window = model.pick(account.snapshot and account.snapshot.windows or {}, resolvedPref)
           table.insert(items, {
             provider = provider,
             account = account,

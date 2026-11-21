@@ -47,6 +47,46 @@ t.group("bar", function()
     bar.call("update")
     t.eq(#env.find(host.barTree, filled), 1, "filled again")
   end)
+
+  t.test("alternates 5-hour and weekly windows in cycle mode with badges", function()
+    local host = env.host()
+    host.config.window = "cycle"
+    host.config.cycle_seconds = 8
+    host.clock = 1_790_000_000 -- 1790000000 // 8 = 223750000 (even -> session)
+    env.claudeCreds(host, "tok-a")
+    env.serveClaude(host, { ["tok-a"] = "a" })
+    env.start(host, "service.luau")
+    local bar = env.start(host, "bar.luau")
+
+    local function hasLabel(text: string): boolean
+      return #env.find(host.barTree, function(node)
+        return node.type == "label" and node.props.text == text
+      end) > 0
+    end
+
+    t.ok(hasLabel("5h"), "shows 5h badge on even cycle slot")
+    t.eq(hasLabel("7d"), false)
+
+    host.clock += 8 -- odd -> weekly
+    bar.call("update")
+    t.ok(hasLabel("7d"), "switches to 7d badge after cycle_seconds")
+    t.eq(hasLabel("5h"), false)
+
+    host.clock += 8 -- back to even -> session
+    bar.call("update")
+    t.ok(hasLabel("5h"), "switches back to 5h on next interval")
+  end)
+
+  t.test("model.pick chooses the tightest window within the requested kind", function()
+    local windows = {
+      model.window({ id = "3p-weekly", kind = "weekly", label = "Claude & GPT · Weekly", usedPercent = 0 }),
+      model.window({ id = "gemini-weekly", kind = "weekly", label = "Gemini · Weekly", usedPercent = 42 }),
+      model.window({ id = "3p-5h", kind = "session", label = "Claude & GPT · Session", usedPercent = 5 }),
+      model.window({ id = "gemini-5h", kind = "session", label = "Gemini · Session", usedPercent = 25 }),
+    }
+    t.eq(model.pick(windows, "weekly").id, "gemini-weekly")
+    t.eq(model.pick(windows, "session").id, "gemini-5h")
+  end)
 end)
 
 t.group("scheduler", function()

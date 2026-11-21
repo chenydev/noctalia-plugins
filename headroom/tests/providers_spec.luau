@@ -189,6 +189,115 @@ t.group("antigravity", function()
     t.eq(windows[1].label, "Gemini · Session")
   end)
 
+  t.test("sends hub/2.24.0 User-Agent and project, merging daily and prod summary buckets", function()
+    local host, p, ctx = env.provider("antigravity")
+    env.write(host, "/home/test/.gemini/antigravity-cli/antigravity-oauth-token", {
+      token = { access_token = "ag-tok-merge", expiry = host.clock + 3600 },
+    })
+    local seenUa, seenSummaryBody = nil, nil
+    host.httpHandler = function(req)
+      if req.url:find("loadCodeAssist", 1, true) then
+        return { ok = true, status = 200, body = '{"paidTier":{"name":"Google AI Ultra"},"cloudaicompanionProject":"real-proj-42"}' }
+      elseif req.url:find("daily-cloudcode-pa", 1, true) and req.url:find("retrieveUserQuotaSummary", 1, true) then
+        seenUa = env.headerOf(req, "User-Agent")
+        seenSummaryBody = req.body
+        return {
+          ok = true,
+          status = 200,
+          body = host.globals.noctalia.json.encode({
+            groups = {
+              {
+                displayName = "Gemini Models",
+                buckets = {
+                  { bucketId = "gemini-weekly", window = "weekly", remainingFraction = 0.85, resetTime = "2026-10-10T17:06:52Z" },
+                  { bucketId = "gemini-5h", window = "5h", remainingFraction = 0.7, resetTime = "2026-10-04T06:11:18Z" },
+                  { bucketId = "gemini-disabled-weekly", window = "weekly", remainingFraction = 0.1, disabled = true },
+                },
+              },
+              {
+                displayName = "Gemini 4 Argon",
+                buckets = {
+                  { bucketId = "gemini-argon-wtu-weekly", window = "weekly", remainingFraction = 0.6, resetTime = "2026-10-10T17:06:52Z" },
+                },
+              },
+            },
+          }),
+        }
+      elseif req.url:find("cloudcode-pa.googleapis.com", 1, true) and req.url:find("retrieveUserQuotaSummary", 1, true) then
+        return {
+          ok = true,
+          status = 200,
+          body = host.globals.noctalia.json.encode({
+            groups = {
+              {
+                displayName = "Gemini Models",
+                buckets = {
+                  -- prod reports untouched 100% for consumer tier; daily reading must win
+                  { bucketId = "gemini-weekly", window = "weekly", remainingFraction = 1, resetTime = "2026-10-10T17:06:52Z" },
+                },
+              },
+              {
+                displayName = "Claude and GPT models",
+                buckets = {
+                  { bucketId = "3p-weekly", window = "weekly", remainingFraction = 0.9, resetTime = "2026-10-11T01:11:18Z" },
+                },
+              },
+            },
+          }),
+        }
+      end
+      return { ok = true, status = 404, body = "" }
+    end
+
+    local snapshot, err = env.fetch(p, ctx)
+    t.eq(err, nil)
+    t.ok(seenUa and seenUa:find("antigravity/hub/2.24.0", 1, true) ~= nil, "sends modern hub User-Agent")
+    t.eq(seenSummaryBody, '{"project":"real-proj-42"}', "passes resolved project to summary")
+    local w = ids(snapshot.windows)
+    t.eq(math.floor(w["gemini-weekly"].usedPercent + 0.5), 15, "daily reading wins over prod")
+    t.eq(math.floor(w["gemini-5h"].usedPercent + 0.5), 30)
+    t.eq(w["gemini-disabled-weekly"], nil, "skips disabled buckets")
+    t.eq(w["gemini-argon-wtu-weekly"].label, "Gemini 4 Argon · Weekly", "preserves dedicated subfamily label")
+    t.eq(math.floor(w["3p-weekly"].usedPercent + 0.5), 10, "fills omitted buckets from prod")
+  end)
+
+  t.test("hides rolling full-window resetTime for untouched summary buckets", function()
+    local host, p, ctx = env.provider("antigravity")
+    local untouched = {
+      groups = {
+        {
+          displayName = "Claude and GPT models",
+          buckets = {
+            -- host.clock is 1_790_000_000 (2026-09-21T14:13:20Z); +5h is 2026-09-21T19:13:20Z
+            { bucketId = "3p-5h", window = "5h", remainingFraction = 1, resetTime = "2026-09-21T19:13:20Z" },
+          },
+        },
+      },
+    }
+    local snapshot, err = p.parse(untouched, ctx)
+    t.eq(err, nil)
+    t.eq(snapshot.windows[1].resetsAt, nil, "suppresses rolling reset on untouched bucket")
+  end)
+
+  t.test("extracts weeklyQuotaInfo in fetchAvailableModels fallback", function()
+    local host, p, ctx = env.provider("antigravity")
+    local payload = {
+      models = {
+        ["gemini-3-pro"] = {
+          displayName = "Gemini 3 Pro",
+          quotaInfo = { remainingFraction = 0.8, resetTime = "2026-10-04T06:11:18Z" },
+          weeklyQuotaInfo = { remainingFraction = 0.55, resetTime = "2026-10-10T17:06:52Z" },
+        },
+      },
+    }
+    local windows = p.parseModels(payload, ctx, nil, "session")
+    local w = ids(windows)
+    t.eq(w["model:gemini-pro"].kind, "session")
+    t.eq(math.floor(w["model:gemini-pro"].usedPercent + 0.5), 20)
+    t.eq(w["model:gemini-pro:weekly"].kind, "weekly")
+    t.eq(math.floor(w["model:gemini-pro:weekly"].usedPercent + 0.5), 45)
+  end)
+
   t.test("expired token never spawns agy CLI to refresh", function()
     local host, p, ctx = env.provider("antigravity")
     host.commands.agy = true

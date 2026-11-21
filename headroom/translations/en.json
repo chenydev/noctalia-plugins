@@ -230,10 +230,15 @@
       "description": "Usage at or above this turns the warning color.",
       "label": "Warning at (%)"
     },
+    "cycle_seconds": {
+      "description": "How often the bar alternates between 5-hour and weekly limits.",
+      "label": "Switch interval (seconds)"
+    },
     "window": {
       "description": "Which usage window each item shows.",
       "label": "Window",
       "option": {
+        "cycle": "Alternate (5-hour / Weekly)",
         "session": "Session (5-hour)",
         "tightest": "Closest to limit",
         "weekly": "Weekly"
@@ -250,6 +255,8 @@
     "resets": "Resets"
   },
   "window": {
+    "badge_session": "5h",
+    "badge_weekly": "7d",
     "code_review": "Code review",
     "other": "Limit",
     "session": "Session",

@@ -133,13 +133,18 @@ function M.tightest(windows: { Window }): Window?
 end
 
 -- Picks the window a compact surface should show for a provider.
--- preference: "tightest" | "session" | "weekly".
+-- preference: "tightest" | "session" | "weekly". When multiple windows match a
+-- preferred kind (e.g. Gemini + Claude/GPT or Weekly + Opus), picks the tightest.
 function M.pick(windows: { Window }, preference: string?): Window?
   if preference == "session" or preference == "weekly" then
+    local matching = {}
     for _, w in windows do
       if w.kind == preference then
-        return w
+        table.insert(matching, w)
       end
+    end
+    if #matching > 0 then
+      return M.tightest(matching)
     end
   end
   return M.tightest(windows)

@@ -27,6 +27,9 @@ local E = model.ErrorCode
 
 local DAILY_BASE = "https://daily-cloudcode-pa.googleapis.com"
 local PROD_BASE = "https://cloudcode-pa.googleapis.com"
+-- Matches Antigravity IDE/Hub 2.24.0 so retrieveUserQuotaSummary returns both
+-- Gemini (5h/weekly/Argon/Carbon) and 3p (Claude & GPT) buckets without gating.
+local USER_AGENT = "antigravity/hub/2.24.0 (aidev_client; os_type=linux; arch=x64; cl=963137146)"
 local CLIENT_METADATA = '{"metadata":{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}}'
 -- Plan and project rarely change; cache per token for 6 hours.
 local PLAN_TTL = 6 * 3600
@@ -130,7 +133,7 @@ local function isFresh(session: Session?, now: number): boolean
 end
 
 local function groupLabel(name: any): string
-  name = if type(name) == "string" then name else ""
+  name = if type(name) == "string" then name:match("^%s*(.-)%s*$") else ""
   if name:find("Gemini", 1, true) then
     return "Gemini"
   elseif name:find("Claude", 1, true) or name:find("GPT", 1, true) then
@@ -139,16 +142,57 @@ local function groupLabel(name: any): string
   return name
 end
 
+-- Keeps dedicated Gemini subfamily pools (e.g. Gemini 4 Argon / Carbon) distinct
+-- from the default Gemini 5h/weekly pool so they do not share identical labels.
+local function bucketFamilyLabel(bucketId: string, groupDisplayName: any): string
+  local trimmed = if type(groupDisplayName) == "string" then groupDisplayName:match("^%s*(.-)%s*$") else ""
+  if bucketId:sub(1, 13) == "gemini-argon-" then
+    return if trimmed ~= "" then trimmed else "Gemini Argon"
+  elseif bucketId:sub(1, 14) == "gemini-carbon-" then
+    return if trimmed ~= "" then trimmed else "Gemini Carbon"
+  elseif bucketId:sub(1, 7) == "gemini-" then
+    if bucketId == "gemini-5h" or bucketId == "gemini-weekly" or bucketId == "gemini-quota" then
+      return "Gemini"
+    end
+    return if trimmed ~= "" then trimmed else "Gemini"
+  elseif bucketId:sub(1, 3) == "3p-" then
+    return "Claude & GPT"
+  end
+  return groupLabel(trimmed)
+end
+
+local function hasGroupBuckets(groups: any): boolean
+  if type(groups) ~= "table" then
+    return false
+  end
+  for _, group in groups do
+    if type(group) == "table" and type(group.buckets) == "table" and #group.buckets > 0 then
+      return true
+    end
+  end
+  return false
+end
+
 local function parseSummaryWindows(data, ctx): { model.Window }
   local body = if type(data) == "table" and type(data.response) == "table" then data.response else data
-  local groups = type(body) == "table" and body.groups or nil
-  if type(groups) ~= "table" then
+  if type(body) ~= "table" then
     return {}
   end
+  local groups
+  if hasGroupBuckets(body.groups) then
+    groups = body.groups
+  elseif type(body.buckets) == "table" then
+    groups = { { displayName = "", buckets = body.buckets } }
+  else
+    return {}
+  end
+  local now = ctx.now()
   local windows = {}
   for _, group in groups do
-    local label = groupLabel(group.displayName)
     for _, bucket in (if type(group.buckets) == "table" then group.buckets else {}) do
+      if bucket.disabled == true then
+        continue
+      end
       local remaining = tonumber(bucket.remainingFraction)
       local id = tostring(bucket.bucketId or "")
       local cadence = bucket.window
@@ -158,14 +202,23 @@ local function parseSummaryWindows(data, ctx): { model.Window }
       if remaining == nil or remaining ~= remaining or remaining < 0 or remaining > 1 or not (weekly or session) then
         continue
       end
+      local label = bucketFamilyLabel(id, group.displayName)
       local kind = if weekly then "weekly" else "session"
+      local periodSeconds = if weekly then WEEK_SECONDS else SESSION_SECONDS
+      local resetsAt = time.parseIso8601(bucket.resetTime)
+      -- Untouched summary buckets report a rolling full-window reset time; hide it.
+      if remaining == 1 and bucket.description == nil and resetsAt ~= nil then
+        if math.abs((resetsAt - now) - periodSeconds) <= 60 then
+          resetsAt = nil
+        end
+      end
       table.insert(windows, model.window({
         id = if id ~= "" then id else `{label}:{kind}`,
         kind = kind,
         label = `{label} · {ctx.tr(`window.{kind}`)}`,
         usedPercent = (1 - remaining) * 100,
-        resetsAt = time.parseIso8601(bucket.resetTime),
-        periodSeconds = if weekly then WEEK_SECONDS else SESSION_SECONDS,
+        resetsAt = resetsAt,
+        periodSeconds = periodSeconds,
       }))
     end
   end
@@ -177,7 +230,7 @@ local function parse(data, ctx): (model.Snapshot?, model.ProviderError?)
   local windows = parseSummaryWindows(data, ctx)
   if #windows == 0 then
     local body = if type(data) == "table" and type(data.response) == "table" then data.response else data
-    if type(body) ~= "table" or type(body.groups) ~= "table" then
+    if type(body) ~= "table" or (type(body.groups) ~= "table" and type(body.buckets) ~= "table") then
       return nil, model.err(E.Parse, "no quota groups")
     end
     return nil, model.err(E.Parse, "no usable quota buckets")
@@ -213,10 +266,11 @@ local function classifyModelFamily(modelId: string, info: any): (string?, string
   return nil, nil, nil
 end
 
--- Parses v1internal:fetchAvailableModels into aggregated family windows.
+-- Parses v1internal:fetchAvailableModels into aggregated family windows, reading
+-- both `quotaInfo` (5h session) and `weeklyQuotaInfo` (weekly) when present.
 -- `skipFamilies` avoids duplicating families already reported by summary.
--- If all Gemini sub-buckets share the exact same remainingFraction and resetTime
--- (shared Gemini pool), collapses them into a single "Gemini" window.
+-- If all Gemini sub-buckets for a cadence share the exact same remainingFraction
+-- and resetTime (shared Gemini pool), collapses them into a single "Gemini" window.
 local function parseModels(data, ctx, skipFamilies: { [string]: boolean }?, kindOverride: string?): { model.Window }
   local body = if type(data) == "table" and type(data.response) == "table" then data.response else data
   local models = type(body) == "table" and body.models or nil
@@ -224,33 +278,30 @@ local function parseModels(data, ctx, skipFamilies: { [string]: boolean }?, kind
     return {}
   end
 
-  local grouped: { [string]: { id: string, label: string, family: string, minRemaining: number, resetsAt: number? } } = {}
+  local grouped: { [string]: { id: string, label: string, family: string, cadence: string, minRemaining: number, resetsAt: number? } } = {}
   local order = {}
 
-  for modelId, info in models do
-    if type(modelId) ~= "string" or type(info) ~= "table" then
-      continue
-    end
-    local quota = info.quotaInfo
+  local function record(id: string, label: string, family: string, cadence: string, quota: any)
     if type(quota) ~= "table" then
-      continue
+      return
     end
     local remaining = tonumber(quota.remainingFraction)
     if remaining == nil or remaining ~= remaining or remaining < 0 or remaining > 1 then
-      continue
+      return
     end
-    local id, label, family = classifyModelFamily(modelId, info)
-    if id == nil or label == nil or family == nil then
-      continue
-    end
-    if skipFamilies and skipFamilies[family] then
-      continue
-    end
+    local key = if cadence == "weekly" then `{id}:weekly` else id
     local resetsAt = time.parseIso8601(quota.resetTime)
-    local entry = grouped[id]
+    local entry = grouped[key]
     if entry == nil then
-      grouped[id] = { id = id, label = label, family = family, minRemaining = remaining, resetsAt = resetsAt }
-      table.insert(order, id)
+      grouped[key] = {
+        id = key,
+        label = label,
+        family = family,
+        cadence = cadence,
+        minRemaining = remaining,
+        resetsAt = resetsAt,
+      }
+      table.insert(order, key)
     else
       if remaining < entry.minRemaining then
         entry.minRemaining = remaining
@@ -261,53 +312,74 @@ local function parseModels(data, ctx, skipFamilies: { [string]: boolean }?, kind
     end
   end
 
-  -- Collapse identical Gemini sub-pools into one clean "Gemini" bucket.
-  local geminiKeys = {}
-  for _, id in order do
-    if grouped[id].family == "gemini" then
-      table.insert(geminiKeys, id)
+  for modelId, info in models do
+    if type(modelId) ~= "string" or type(info) ~= "table" then
+      continue
     end
+    local id, label, family = classifyModelFamily(modelId, info)
+    if id == nil or label == nil or family == nil then
+      continue
+    end
+    if skipFamilies and skipFamilies[family] then
+      continue
+    end
+    record(id, label, family, "session", info.quotaInfo)
+    record(id, label, family, "weekly", info.weeklyQuotaInfo)
   end
-  if #geminiKeys > 1 then
-    local first = grouped[geminiKeys[1]]
-    local samePool = true
-    for i = 2, #geminiKeys do
-      local other = grouped[geminiKeys[i]]
-      if math.abs(other.minRemaining - first.minRemaining) > 1e-6 or other.resetsAt ~= first.resetsAt then
-        samePool = false
-        break
+
+  -- Collapse identical Gemini sub-pools per cadence into one clean "Gemini" bucket.
+  for _, cadence in { "session", "weekly" } do
+    local geminiKeys = {}
+    for _, key in order do
+      local entry = grouped[key]
+      if entry and entry.family == "gemini" and entry.cadence == cadence then
+        table.insert(geminiKeys, key)
       end
     end
-    if samePool then
-      for _, id in geminiKeys do
-        grouped[id] = nil
+    if #geminiKeys > 1 then
+      local first = grouped[geminiKeys[1]]
+      local samePool = true
+      for i = 2, #geminiKeys do
+        local other = grouped[geminiKeys[i]]
+        if math.abs(other.minRemaining - first.minRemaining) > 1e-6 or other.resetsAt ~= first.resetsAt then
+          samePool = false
+          break
+        end
       end
-      grouped["model:gemini"] = {
-        id = "model:gemini",
-        label = "Gemini",
-        family = "gemini",
-        minRemaining = first.minRemaining,
-        resetsAt = first.resetsAt,
-      }
-      order = {}
-      for id in grouped do
-        table.insert(order, id)
+      if samePool then
+        for _, key in geminiKeys do
+          grouped[key] = nil
+        end
+        local collapsedId = if cadence == "weekly" then "model:gemini:weekly" else "model:gemini"
+        grouped[collapsedId] = {
+          id = collapsedId,
+          label = "Gemini",
+          family = "gemini",
+          cadence = cadence,
+          minRemaining = first.minRemaining,
+          resetsAt = first.resetsAt,
+        }
+        order = {}
+        for key in grouped do
+          table.insert(order, key)
+        end
       end
     end
   end
 
   table.sort(order)
   local windows = {}
-  local kind = kindOverride or "model"
-  for _, id in order do
-    local entry = grouped[id]
+  local sessionKind = kindOverride or "model"
+  for _, key in order do
+    local entry = grouped[key]
+    local isWeekly = entry.cadence == "weekly"
     table.insert(windows, model.window({
       id = entry.id,
-      kind = kind,
-      label = `{entry.label} · {ctx.tr("window.session")}`,
+      kind = if isWeekly then "weekly" else sessionKind,
+      label = `{entry.label} · {ctx.tr(if isWeekly then "window.weekly" else "window.session")}`,
       usedPercent = (1 - entry.minRemaining) * 100,
       resetsAt = entry.resetsAt,
-      periodSeconds = SESSION_SECONDS,
+      periodSeconds = if isWeekly then WEEK_SECONDS else SESSION_SECONDS,
     }))
   end
   return windows
@@ -408,10 +480,69 @@ local function modelsRequestBody(project: string?): string
   return "{}"
 end
 
+-- Queries both daily-cloudcode-pa (primary metered host for consumer accounts)
+-- and cloudcode-pa in parallel and merges buckets by id. The daily host wins
+-- on duplicate bucket ids; prod only fills buckets omitted by daily.
+local function querySummaryMerged(ctx, headers, body: string, done: ({ model.Window }, model.ProviderError?) -> ())
+  local pending = 2
+  local dailyWindows: { model.Window } = {}
+  local prodWindows: { model.Window } = {}
+  local dailyErr: model.ProviderError? = nil
+  local prodErr: model.ProviderError? = nil
+
+  local function finish()
+    pending -= 1
+    if pending > 0 then
+      return
+    end
+    local merged = {}
+    local seen: { [string]: boolean } = {}
+    for _, w in dailyWindows do
+      if not seen[w.id] then
+        seen[w.id] = true
+        table.insert(merged, w)
+      end
+    end
+    for _, w in prodWindows do
+      if not seen[w.id] then
+        seen[w.id] = true
+        table.insert(merged, w)
+      end
+    end
+    if #merged > 0 then
+      done(merged, nil)
+      return
+    end
+    local fatal = if dailyErr and (dailyErr.code == E.Auth or dailyErr.code == E.NoPlan)
+      then dailyErr
+      elseif prodErr and (prodErr.code == E.Auth or prodErr.code == E.NoPlan) then prodErr
+      else dailyErr or prodErr
+    done({}, fatal)
+  end
+
+  ctx.postJson(`{DAILY_BASE}{QUOTA_PATH}`, headers, body, function(data, err)
+    if err == nil then
+      dailyWindows = parseSummaryWindows(data, ctx)
+    else
+      dailyErr = err
+    end
+    finish()
+  end, classify)
+
+  ctx.postJson(`{PROD_BASE}{QUOTA_PATH}`, headers, body, function(data, err)
+    if err == nil then
+      prodWindows = parseSummaryWindows(data, ctx)
+    else
+      prodErr = err
+    end
+    finish()
+  end, classify)
+end
+
 local function query(ctx, session: Session, done)
   local headers = {
     ["Authorization"] = `Bearer {session.accessToken}`,
-    ["User-Agent"] = "antigravity", -- required by the endpoint
+    ["User-Agent"] = USER_AGENT,
   }
 
   withAssist(ctx, headers, function(plan, project, assistErr)
@@ -420,13 +551,13 @@ local function query(ctx, session: Session, done)
       return
     end
 
-    postApi(ctx, QUOTA_PATH, headers, "{}", function(summaryData, summaryErr)
+    local body = modelsRequestBody(project)
+    querySummaryMerged(ctx, headers, body, function(summaryWindows, summaryErr)
       if summaryErr and (summaryErr.code == E.Auth or summaryErr.code == E.NoPlan) then
         done(nil, summaryErr)
         return
       end
 
-      local summaryWindows = if summaryErr == nil then parseSummaryWindows(summaryData, ctx) else {}
       local families = presentFamilies(summaryWindows)
       local needModels = (#summaryWindows == 0) or (not families.gemini)
 
@@ -435,7 +566,7 @@ local function query(ctx, session: Session, done)
         return
       end
 
-      postApi(ctx, MODELS_PATH, headers, modelsRequestBody(project), function(modelsData, modelsErr)
+      postApi(ctx, MODELS_PATH, headers, body, function(modelsData, modelsErr)
         local extraWindows = if modelsErr == nil
           then parseModels(modelsData, ctx, families, if #summaryWindows == 0 then "session" else "model")
           else {}
