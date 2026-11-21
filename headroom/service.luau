@@ -93,7 +93,7 @@ local function isOff(id: string): boolean
 end
 
 local function intervalSeconds(): number
-  return math.clamp(state.config("refresh_minutes", 5), 1, 120) * 60
+  return math.clamp(state.config("refresh_minutes", 10), 1, 120) * 60
 end
 
 -- Every listed runtime, as a list taken now: callers may change the lists.

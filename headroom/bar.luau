@@ -37,7 +37,7 @@ local function windowBadge(window): string?
 end
 
 local function interval(): number
-  return if type(report) == "table" and report.interval then report.interval else 300
+  return if type(report) == "table" and report.interval then report.interval else 600
 end
 
 local function itemNodes(item, vertical: boolean, style: string, ringStyle: string, showBadge: boolean, now: number)

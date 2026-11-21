@@ -43,6 +43,10 @@ local KEYRING_LOOKUP = { "secret-tool", "lookup", "service", "gemini", "username
 local TOKEN_FILE = "~/.gemini/antigravity-cli/antigravity-oauth-token"
 local CLI_SETTINGS = "~/.gemini/antigravity-cli/settings.json"
 local IDE_CONFIG_DIR = "~/.config/Antigravity"
+local T3_PROVIDERS_DIR = "~/.t3/userdata/providers/antigravity"
+local OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+-- Refresh an expiring access token 60s before expiry to avoid mid-request 401s.
+local EXPIRY_SKEW_SECONDS = 60
 
 -- Shorter rest windows so a transient keyring lock at login recovers promptly.
 local KEYRING_REST = 5 * 60
@@ -57,7 +61,18 @@ local assistCache: { plan: string?, project: string?, at: number, auth: string? 
   auth = nil,
 }
 
-type Session = { accessToken: string, expiry: any }
+-- In-memory access token minted from T3's acp_token.json when all on-disk
+-- access tokens have expired. Never written back to disk; Google OAuth refresh
+-- tokens are reusable and do not rotate away active T3 / agy sessions.
+local memoryTokenCache: { fingerprint: string?, accessToken: string?, expiresAt: number, project: string? } = {
+  fingerprint = nil,
+  accessToken = nil,
+  expiresAt = -math.huge,
+  project = nil,
+}
+
+type Session = { accessToken: string, expiry: any, project: string? }
+type AcpCredentials = { clientId: string, clientSecret: string, refreshToken: string, project: string?, fingerprint: string }
 
 -- Accepts go-keyring's "go-keyring-base64:" wrapper, a { token = {...} }
 -- envelope or a flat token object, with snake_case or camelCase keys.
@@ -93,43 +108,189 @@ local function tokenFilePath(ctx): string
   return ctx.expandPath(TOKEN_FILE)
 end
 
-local function readSession(ctx, done: (Session?) -> ())
-  local function fromFile()
-    local path = tokenFilePath(ctx)
-    if not ctx.fileExists(path) then
-      done(nil)
-      return
-    end
-    local raw = ctx.readFile(path)
-    done(parseSession(raw, ctx))
+local function expiryUnix(expiry: any): number?
+  local at = time.toUnix(expiry)
+  if at == nil then
+    return nil
   end
-  if not ctx.which("secret-tool") or ctx.now() < keyringRestUntil then
-    fromFile()
-    return
+  if at > 1e11 then
+    at /= 1000
   end
-  ctx.run(KEYRING_LOOKUP, 5000, function(result)
-    local session = result and result.exitCode == 0 and parseSession(result.stdout, ctx) or nil
-    if session then
-      done(session)
-      return
-    end
-    keyringRestUntil = ctx.now() + (if result == nil then KEYRING_REST else KEYRING_MISS_REST)
-    fromFile()
-  end)
+  return at
 end
 
 local function isFresh(session: Session?, now: number): boolean
   if session == nil then
     return false
   end
-  local at = time.toUnix(session.expiry)
+  local at = expiryUnix(session.expiry)
   if at == nil then
     return true
   end
-  if at > 1e11 then
-    at /= 1000
+  return at > now + EXPIRY_SKEW_SECONDS
+end
+
+local function t3ProfileDirs(ctx): { string }
+  local root = ctx.expandPath(T3_PROVIDERS_DIR)
+  if type(ctx.listDir) ~= "function" then
+    return {}
   end
-  return at > now
+  local entries = ctx.listDir(root)
+  if type(entries) ~= "table" then
+    return {}
+  end
+  table.sort(entries)
+  local dirs = {}
+  for _, name in entries do
+    if type(name) == "string" and name ~= "" and name:sub(1, 1) ~= "." then
+      table.insert(dirs, `{root}/{name}/antigravity-acp`)
+    end
+  end
+  return dirs
+end
+
+local function readFileSessions(ctx): { Session }
+  local sessions = {}
+  local paths = { tokenFilePath(ctx) }
+  for _, dir in t3ProfileDirs(ctx) do
+    table.insert(paths, `{dir}/antigravity-oauth-token`)
+  end
+  for _, path in paths do
+    if ctx.fileExists(path) then
+      local s = parseSession(ctx.readFile(path), ctx)
+      if s then
+        table.insert(sessions, s)
+      end
+    end
+  end
+  return sessions
+end
+
+local function readAcpCredentials(ctx): AcpCredentials?
+  for _, dir in t3ProfileDirs(ctx) do
+    local path = `{dir}/acp_token.json`
+    if ctx.fileExists(path) then
+      local data = ctx.readJson(path)
+      if type(data) == "table"
+        and type(data.client_id) == "string" and data.client_id ~= ""
+        and type(data.client_secret) == "string" and data.client_secret ~= ""
+        and type(data.refresh_token) == "string" and data.refresh_token ~= ""
+      then
+        local proj = if type(data.project_id) == "string" and data.project_id ~= "" and data.project_id ~= "aicode-consumers"
+          then data.project_id
+          else nil
+        return {
+          clientId = data.client_id,
+          clientSecret = data.client_secret,
+          refreshToken = data.refresh_token,
+          project = proj,
+          fingerprint = `{data.client_id}\0{data.refresh_token}\0{proj or ""}`,
+        }
+      end
+    end
+  end
+  return nil
+end
+
+-- Picks the freshest valid session across keyring, CLI file and T3 profiles.
+-- Falls back to an expired session if none are fresh (so caller knows credentials exist).
+local function pickBestSession(candidates: { Session }, now: number): Session?
+  local bestFresh: Session? = nil
+  local bestFreshExp = -math.huge
+  local fallback: Session? = nil
+  local fallbackExp = -math.huge
+  for _, s in candidates do
+    local exp = expiryUnix(s.expiry) or math.huge
+    if isFresh(s, now) then
+      if bestFresh == nil or exp > bestFreshExp then
+        bestFresh, bestFreshExp = s, exp
+      end
+    elseif fallback == nil or exp > fallbackExp then
+      fallback, fallbackExp = s, exp
+    end
+  end
+  return bestFresh or fallback
+end
+
+local function readSession(ctx, done: (Session?) -> ())
+  local fileSessions = readFileSessions(ctx)
+  local now = ctx.now()
+  local function choose(keyringSession: Session?)
+    local candidates = table.clone(fileSessions)
+    if keyringSession then
+      table.insert(candidates, keyringSession)
+    end
+    done(pickBestSession(candidates, now))
+  end
+
+  -- Fast path: if an on-disk file (e.g. T3 Code's refreshed token) is already fresh,
+  -- use it immediately without even waking the OS keyring.
+  local bestDisk = pickBestSession(fileSessions, now)
+  if bestDisk and isFresh(bestDisk, now) then
+    done(bestDisk)
+    return
+  end
+
+  if not ctx.which("secret-tool") or now < keyringRestUntil then
+    choose(nil)
+    return
+  end
+  ctx.run(KEYRING_LOOKUP, 5000, function(result)
+    local session = result and result.exitCode == 0 and parseSession(result.stdout, ctx) or nil
+    if session == nil then
+      keyringRestUntil = ctx.now() + (if result == nil then KEYRING_REST else KEYRING_MISS_REST)
+    end
+    choose(session)
+  end)
+end
+
+local function jsonEscape(s: string): string
+  return (s:gsub("\\", "\\\\"):gsub('"', '\\"'))
+end
+
+-- Mints a short-lived in-memory access token from T3's acp_token.json.
+-- Cached for its ~55m lifetime; never writes anything to disk.
+local function refreshFromAcp(ctx, creds: AcpCredentials, done: (Session?, model.ProviderError?) -> ())
+  local now = ctx.now()
+  if memoryTokenCache.fingerprint == creds.fingerprint
+    and type(memoryTokenCache.accessToken) == "string"
+    and memoryTokenCache.expiresAt > now + EXPIRY_SKEW_SECONDS
+  then
+    done({
+      accessToken = memoryTokenCache.accessToken,
+      expiry = memoryTokenCache.expiresAt,
+      project = memoryTokenCache.project,
+    }, nil)
+    return
+  end
+
+  local body = '{"client_id":"'
+    .. jsonEscape(creds.clientId)
+    .. '","client_secret":"'
+    .. jsonEscape(creds.clientSecret)
+    .. '","refresh_token":"'
+    .. jsonEscape(creds.refreshToken)
+    .. '","grant_type":"refresh_token"}'
+
+  ctx.postJson(OAUTH_TOKEN_URL, {}, body, function(data, err)
+    if err ~= nil or type(data) ~= "table" or type(data.access_token) ~= "string" or data.access_token == "" then
+      done(nil, model.err(E.Expired))
+      return
+    end
+    local expiresIn = tonumber(data.expires_in) or 3600
+    local expiresAt = ctx.now() + math.max(120, expiresIn)
+    memoryTokenCache = {
+      fingerprint = creds.fingerprint,
+      accessToken = data.access_token,
+      expiresAt = expiresAt,
+      project = creds.project,
+    }
+    done({
+      accessToken = data.access_token,
+      expiry = expiresAt,
+      project = creds.project,
+    }, nil)
+  end)
 end
 
 local function groupLabel(name: any): string
@@ -480,62 +641,48 @@ local function modelsRequestBody(project: string?): string
   return "{}"
 end
 
--- Queries both daily-cloudcode-pa (primary metered host for consumer accounts)
--- and cloudcode-pa in parallel and merges buckets by id. The daily host wins
--- on duplicate bucket ids; prod only fills buckets omitted by daily.
+-- Queries daily-cloudcode-pa first (the metered host for consumer accounts).
+-- Only falls through to cloudcode-pa when daily fails, returns nothing, or omits
+-- a model family (Gemini or Claude/GPT), avoiding redundant HTTP calls on every poll.
+-- Daily readings always win on duplicate bucket ids; prod only fills missing buckets.
 local function querySummaryMerged(ctx, headers, body: string, done: ({ model.Window }, model.ProviderError?) -> ())
-  local pending = 2
-  local dailyWindows: { model.Window } = {}
-  local prodWindows: { model.Window } = {}
-  local dailyErr: model.ProviderError? = nil
-  local prodErr: model.ProviderError? = nil
-
-  local function finish()
-    pending -= 1
-    if pending > 0 then
+  ctx.postJson(`{DAILY_BASE}{QUOTA_PATH}`, headers, body, function(dailyData, dailyErr)
+    if dailyErr and (dailyErr.code == E.Auth or dailyErr.code == E.NoPlan) then
+      done({}, dailyErr)
       return
     end
-    local merged = {}
-    local seen: { [string]: boolean } = {}
-    for _, w in dailyWindows do
-      if not seen[w.id] then
-        seen[w.id] = true
-        table.insert(merged, w)
-      end
-    end
-    for _, w in prodWindows do
-      if not seen[w.id] then
-        seen[w.id] = true
-        table.insert(merged, w)
-      end
-    end
-    if #merged > 0 then
-      done(merged, nil)
+    local dailyWindows = if dailyErr == nil then parseSummaryWindows(dailyData, ctx) else {}
+    local fams = presentFamilies(dailyWindows)
+    if #dailyWindows > 0 and fams.gemini and fams.claude_gpt then
+      done(dailyWindows, nil)
       return
     end
-    local fatal = if dailyErr and (dailyErr.code == E.Auth or dailyErr.code == E.NoPlan)
-      then dailyErr
-      elseif prodErr and (prodErr.code == E.Auth or prodErr.code == E.NoPlan) then prodErr
-      else dailyErr or prodErr
-    done({}, fatal)
-  end
 
-  ctx.postJson(`{DAILY_BASE}{QUOTA_PATH}`, headers, body, function(data, err)
-    if err == nil then
-      dailyWindows = parseSummaryWindows(data, ctx)
-    else
-      dailyErr = err
-    end
-    finish()
-  end, classify)
-
-  ctx.postJson(`{PROD_BASE}{QUOTA_PATH}`, headers, body, function(data, err)
-    if err == nil then
-      prodWindows = parseSummaryWindows(data, ctx)
-    else
-      prodErr = err
-    end
-    finish()
+    ctx.postJson(`{PROD_BASE}{QUOTA_PATH}`, headers, body, function(prodData, prodErr)
+      local prodWindows = if prodErr == nil then parseSummaryWindows(prodData, ctx) else {}
+      local merged = {}
+      local seen: { [string]: boolean } = {}
+      for _, w in dailyWindows do
+        if not seen[w.id] then
+          seen[w.id] = true
+          table.insert(merged, w)
+        end
+      end
+      for _, w in prodWindows do
+        if not seen[w.id] then
+          seen[w.id] = true
+          table.insert(merged, w)
+        end
+      end
+      if #merged > 0 then
+        done(merged, nil)
+        return
+      end
+      local fatal = if prodErr and (prodErr.code == E.Auth or prodErr.code == E.NoPlan)
+        then prodErr
+        else dailyErr or prodErr
+      done({}, fatal)
+    end, classify)
   end, classify)
 end
 
@@ -597,10 +744,19 @@ return provider.define({
   },
 
   isConfigured = function(ctx)
-    return ctx.fileExists(ctx.expandPath(CLI_SETTINGS))
+    if ctx.fileExists(ctx.expandPath(CLI_SETTINGS))
       or ctx.fileExists(tokenFilePath(ctx))
       or ctx.fileExists(ctx.expandPath(IDE_CONFIG_DIR))
       or ctx.which("secret-tool")
+    then
+      return true
+    end
+    for _, dir in t3ProfileDirs(ctx) do
+      if ctx.fileExists(`{dir}/antigravity-oauth-token`) or ctx.fileExists(`{dir}/acp_token.json`) then
+        return true
+      end
+    end
+    return false
   end,
 
   signInHint = function(ctx)
@@ -609,10 +765,23 @@ return provider.define({
 
   fetch = function(ctx, done)
     readSession(ctx, function(session)
+      if session ~= nil and isFresh(session, ctx.now()) then
+        query(ctx, session, done)
+        return
+      end
+      local acp = readAcpCredentials(ctx)
+      if acp ~= nil then
+        refreshFromAcp(ctx, acp, function(refreshed, err)
+          if refreshed ~= nil then
+            query(ctx, refreshed, done)
+          else
+            done(nil, err or model.err(E.Expired))
+          end
+        end)
+        return
+      end
       if session == nil then
         done(nil, model.err(E.NotConfigured))
-      elseif isFresh(session, ctx.now()) then
-        query(ctx, session, done)
       else
         -- Strictly read-only: never spawn `agy models` in the background.
         done(nil, model.err(E.Expired))

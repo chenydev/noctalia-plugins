@@ -298,6 +298,86 @@ t.group("antigravity", function()
     t.eq(math.floor(w["model:gemini-pro:weekly"].usedPercent + 0.5), 45)
   end)
 
+  t.test("skips prod summary request when daily already returns both Gemini and 3p groups", function()
+    local host, p, ctx = env.provider("antigravity")
+    env.write(host, "/home/test/.gemini/antigravity-cli/antigravity-oauth-token", {
+      token = { access_token = "ag-tok-single", expiry = host.clock + 3600 },
+    })
+    env.serve(host, {
+      ["loadCodeAssist"] = '{"paidTier":{"name":"Google AI Ultra"},"cloudaicompanionProject":"proj-9"}',
+      ["retrieveUserQuotaSummary"] = env.fixture("antigravity_quota.json"),
+    })
+    local snapshot, err = env.fetch(p, ctx)
+    t.eq(err, nil)
+    t.eq(#snapshot.windows, 4)
+    t.eq(env.requestsTo(host, "daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"), 1)
+    t.eq(env.requestsTo(host, "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"), 0, "no redundant prod call")
+  end)
+
+  t.test("prefers fresh T3 Code profile token when keyring token has expired", function()
+    local host, p, ctx = env.provider("antigravity")
+    host.commands["secret-tool"] = true
+    host.runHandler = function()
+      return {
+        exitCode = 0,
+        stdout = host.globals.noctalia.json.encode({
+          token = { access_token = "expired-keyring-tok", expiry = host.clock - 30 },
+        }),
+      }
+    end
+    env.write(host, "/home/test/.t3/userdata/providers/antigravity/prof1/antigravity-acp/antigravity-oauth-token", {
+      token = { access_token = "fresh-t3-tok", expiry = host.clock + 3600 },
+    })
+    local seenAuth = nil
+    host.httpHandler = function(req)
+      seenAuth = env.headerOf(req, "Authorization")
+      if req.url:find("loadCodeAssist", 1, true) then
+        return { ok = true, status = 200, body = '{"paidTier":{"name":"Google AI Ultra"}}' }
+      elseif req.url:find("retrieveUserQuotaSummary", 1, true) then
+        return { ok = true, status = 200, body = env.fixture("antigravity_quota.json") }
+      end
+      return { ok = true, status = 404, body = "" }
+    end
+    local snapshot, err = env.fetch(p, ctx)
+    t.eq(err, nil)
+    t.eq(seenAuth, "Bearer fresh-t3-tok", "picks fresh T3 token without hitting keyring")
+    t.eq(#host.spawned, 0, "skips secret-tool when disk token is already fresh")
+    t.ok(#snapshot.windows == 4)
+  end)
+
+  t.test("refreshes in-memory token from T3 acp_token.json and caches it across polls", function()
+    local host, p, ctx = env.provider("antigravity")
+    env.write(host, "/home/test/.gemini/antigravity-cli/antigravity-oauth-token", {
+      token = { access_token = "expired-cli-tok", expiry = host.clock - 30 },
+    })
+    local acpPath = "/home/test/.t3/userdata/providers/antigravity/prof1/antigravity-acp/acp_token.json"
+    env.write(host, acpPath, {
+      client_id = "cid-1",
+      client_secret = "csec-1",
+      refresh_token = "rtok-1",
+      project_id = "aicode-consumers",
+    })
+    local originalAcp = host.files[acpPath]
+    env.serve(host, {
+      ["oauth2.googleapis.com/token"] = '{"access_token":"minted-tok","expires_in":3599}',
+      ["loadCodeAssist"] = '{"paidTier":{"name":"Google AI Ultra"}}',
+      ["retrieveUserQuotaSummary"] = env.fixture("antigravity_quota.json"),
+    })
+
+    local snap1, err1 = env.fetch(p, ctx)
+    t.eq(err1, nil)
+    t.eq(#snap1.windows, 4)
+    t.eq(env.requestsTo(host, "oauth2.googleapis.com/token"), 1, "mints access token once")
+    t.eq(host.files[acpPath], originalAcp, "never writes back to acp_token.json")
+
+    -- Second poll 10 minutes later reuses cached in-memory token without another OAuth refresh.
+    host.clock += 600
+    local snap2, err2 = env.fetch(p, ctx)
+    t.eq(err2, nil)
+    t.eq(#snap2.windows, 4)
+    t.eq(env.requestsTo(host, "oauth2.googleapis.com/token"), 1, "reuses cached in-memory token")
+  end)
+
   t.test("expired token never spawns agy CLI to refresh", function()
     local host, p, ctx = env.provider("antigravity")
     host.commands.agy = true

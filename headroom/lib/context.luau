@@ -21,6 +21,7 @@ function M.new(host, userAgent: string)
     env = host.getenv,
     expandPath = host.expandPath,
     fileExists = host.fileExists,
+    listDir = host.listDir,
     readFile = function(path: string)
       return (host.readFile(path))
     end,

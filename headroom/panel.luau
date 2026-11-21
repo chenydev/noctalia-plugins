@@ -161,7 +161,7 @@ function render()
   lastRenderAt = now
   expire(now)
   options.now = now
-  options.interval = if type(report) == "table" and report.interval then report.interval else 300
+  options.interval = if type(report) == "table" and report.interval then report.interval else 600
   options.mode = mode
   options.copied = copied and copied.key
 

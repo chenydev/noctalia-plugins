@@ -44,6 +44,7 @@ t.group("service", function()
     -- because its numbers are older, must not show up as a second account.
     local host = env.host()
     claudeOnly(host)
+    host.config.refresh_minutes = 5
     env.claudeCreds(host, "tok-a")
     env.claudeCreds(host, "tok-a2", WORK)
     env.serveClaude(host, { ["tok-a"] = "a", ["tok-a2"] = "a" })
