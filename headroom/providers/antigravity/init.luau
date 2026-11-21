@@ -25,12 +25,14 @@ local jwt = require("../../lib/jwt.luau")
 
 local E = model.ErrorCode
 
-local CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+local DAILY_BASE = "https://daily-cloudcode-pa.googleapis.com"
+local PROD_BASE = "https://cloudcode-pa.googleapis.com"
 local CLIENT_METADATA = '{"metadata":{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}}'
 -- Plan and project rarely change; cache per token for 6 hours.
 local PLAN_TTL = 6 * 3600
-local QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
-local MODELS_URL = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+local CODE_ASSIST_PATH = "/v1internal:loadCodeAssist"
+local QUOTA_PATH = "/v1internal:retrieveUserQuotaSummary"
+local MODELS_PATH = "/v1internal:fetchAvailableModels"
 local SESSION_SECONDS = model.SESSION_SECONDS
 local WEEK_SECONDS = model.WEEK_SECONDS
 
@@ -184,13 +186,18 @@ local function parse(data, ctx): (model.Snapshot?, model.ProviderError?)
 end
 
 -- Maps a model entry from fetchAvailableModels to a compact family bucket.
--- Internal helper models without displayName (chat_*, tab_*) are skipped.
-local function classifyModelFamily(modelId: string, displayName: any): (string?, string?, string?)
-  if type(displayName) ~= "string" or displayName == "" then
+-- Internal helper models without displayName or resetTime (chat_*, tab_*) are skipped,
+-- while named Gemini/Claude/GPT models and newer gemini-4* models with resetTime are kept.
+local function classifyModelFamily(modelId: string, info: any): (string?, string?, string?)
+  local idLow = modelId:lower()
+  if idLow:sub(1, 5) == "chat_" or idLow:sub(1, 4) == "tab_" then
     return nil, nil, nil
   end
-  local idLow = modelId:lower()
+  local displayName = if type(info.displayName) == "string" then info.displayName else ""
   local nameLow = displayName:lower()
+  if displayName == "" and not (idLow:find("gemini", 1, true) and type(info.quotaInfo) == "table" and info.quotaInfo.resetTime ~= nil) then
+    return nil, nil, nil
+  end
   if idLow:find("gemini", 1, true) or nameLow:find("gemini", 1, true) then
     if idLow:find("image", 1, true) or nameLow:find("image", 1, true) then
       return nil, nil, nil
@@ -208,6 +215,8 @@ end
 
 -- Parses v1internal:fetchAvailableModels into aggregated family windows.
 -- `skipFamilies` avoids duplicating families already reported by summary.
+-- If all Gemini sub-buckets share the exact same remainingFraction and resetTime
+-- (shared Gemini pool), collapses them into a single "Gemini" window.
 local function parseModels(data, ctx, skipFamilies: { [string]: boolean }?, kindOverride: string?): { model.Window }
   local body = if type(data) == "table" and type(data.response) == "table" then data.response else data
   local models = type(body) == "table" and body.models or nil
@@ -215,7 +224,7 @@ local function parseModels(data, ctx, skipFamilies: { [string]: boolean }?, kind
     return {}
   end
 
-  local grouped: { [string]: { id: string, label: string, minRemaining: number, resetsAt: number? } } = {}
+  local grouped: { [string]: { id: string, label: string, family: string, minRemaining: number, resetsAt: number? } } = {}
   local order = {}
 
   for modelId, info in models do
@@ -230,7 +239,7 @@ local function parseModels(data, ctx, skipFamilies: { [string]: boolean }?, kind
     if remaining == nil or remaining ~= remaining or remaining < 0 or remaining > 1 then
       continue
     end
-    local id, label, family = classifyModelFamily(modelId, info.displayName)
+    local id, label, family = classifyModelFamily(modelId, info)
     if id == nil or label == nil or family == nil then
       continue
     end
@@ -240,7 +249,7 @@ local function parseModels(data, ctx, skipFamilies: { [string]: boolean }?, kind
     local resetsAt = time.parseIso8601(quota.resetTime)
     local entry = grouped[id]
     if entry == nil then
-      grouped[id] = { id = id, label = label, minRemaining = remaining, resetsAt = resetsAt }
+      grouped[id] = { id = id, label = label, family = family, minRemaining = remaining, resetsAt = resetsAt }
       table.insert(order, id)
     else
       if remaining < entry.minRemaining then
@@ -248,6 +257,41 @@ local function parseModels(data, ctx, skipFamilies: { [string]: boolean }?, kind
       end
       if resetsAt and (entry.resetsAt == nil or resetsAt < entry.resetsAt) then
         entry.resetsAt = resetsAt
+      end
+    end
+  end
+
+  -- Collapse identical Gemini sub-pools into one clean "Gemini" bucket.
+  local geminiKeys = {}
+  for _, id in order do
+    if grouped[id].family == "gemini" then
+      table.insert(geminiKeys, id)
+    end
+  end
+  if #geminiKeys > 1 then
+    local first = grouped[geminiKeys[1]]
+    local samePool = true
+    for i = 2, #geminiKeys do
+      local other = grouped[geminiKeys[i]]
+      if math.abs(other.minRemaining - first.minRemaining) > 1e-6 or other.resetsAt ~= first.resetsAt then
+        samePool = false
+        break
+      end
+    end
+    if samePool then
+      for _, id in geminiKeys do
+        grouped[id] = nil
+      end
+      grouped["model:gemini"] = {
+        id = "model:gemini",
+        label = "Gemini",
+        family = "gemini",
+        minRemaining = first.minRemaining,
+        resetsAt = first.resetsAt,
+      }
+      order = {}
+      for id in grouped do
+        table.insert(order, id)
       end
     end
   end
@@ -314,13 +358,25 @@ local function classify(status: number, body: string): string?
   return nil
 end
 
+-- Posts against daily-cloudcode-pa first (where agy/Antigravity actually tracks
+-- live quota), falling back to cloudcode-pa on transport/server errors.
+local function postApi(ctx, path: string, headers, body: string, done)
+  ctx.postJson(`{DAILY_BASE}{path}`, headers, body, function(data, err)
+    if err == nil or err.code == E.Auth or err.code == E.NoPlan then
+      done(data, err)
+      return
+    end
+    ctx.postJson(`{PROD_BASE}{path}`, headers, body, done, classify)
+  end, classify)
+end
+
 local function withAssist(ctx, headers, done: (string?, string?, model.ProviderError?) -> ())
   local auth = headers["Authorization"]
   if assistCache.auth == auth and ctx.now() - assistCache.at < PLAN_TTL then
     done(assistCache.plan, assistCache.project, nil)
     return
   end
-  ctx.postJson(CODE_ASSIST_URL, headers, CLIENT_METADATA, function(data, err)
+  postApi(ctx, CODE_ASSIST_PATH, headers, CLIENT_METADATA, function(data, err)
     if err == nil and type(data) == "table" then
       assistCache = {
         plan = planFrom(data),
@@ -341,7 +397,7 @@ local function withAssist(ctx, headers, done: (string?, string?, model.ProviderE
     else
       done(nil, nil, nil)
     end
-  end, classify)
+  end)
 end
 
 local function modelsRequestBody(project: string?): string
@@ -364,7 +420,7 @@ local function query(ctx, session: Session, done)
       return
     end
 
-    ctx.postJson(QUOTA_URL, headers, "{}", function(summaryData, summaryErr)
+    postApi(ctx, QUOTA_PATH, headers, "{}", function(summaryData, summaryErr)
       if summaryErr and (summaryErr.code == E.Auth or summaryErr.code == E.NoPlan) then
         done(nil, summaryErr)
         return
@@ -379,7 +435,7 @@ local function query(ctx, session: Session, done)
         return
       end
 
-      ctx.postJson(MODELS_URL, headers, modelsRequestBody(project), function(modelsData, modelsErr)
+      postApi(ctx, MODELS_PATH, headers, modelsRequestBody(project), function(modelsData, modelsErr)
         local extraWindows = if modelsErr == nil
           then parseModels(modelsData, ctx, families, if #summaryWindows == 0 then "session" else "model")
           else {}
@@ -397,8 +453,8 @@ local function query(ctx, session: Session, done)
         else
           done(nil, summaryErr or modelsErr or model.err(E.Parse, "no usable quota buckets"))
         end
-      end, classify)
-    end, classify)
+      end)
+    end)
   end)
 end
 

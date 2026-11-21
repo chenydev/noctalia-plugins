@@ -174,6 +174,21 @@ t.group("antigravity", function()
     t.eq(math.floor(w["model:claude-gpt"].usedPercent + 0.5), 35)
   end)
 
+  t.test("collapses shared Gemini pool when all Gemini models report identical quota", function()
+    local host, p, ctx = env.provider("antigravity")
+    local shared = {
+      models = {
+        ["gemini-2.5-pro"] = { displayName = "Gemini 2.5 Pro", quotaInfo = { remainingFraction = 0.965, resetTime = "2026-10-04T06:11:18Z" } },
+        ["gemini-3-flash"] = { displayName = "Gemini 3 Flash", quotaInfo = { remainingFraction = 0.965, resetTime = "2026-10-04T06:11:18Z" } },
+        ["gemini-4-hydrogen-sonar"] = { quotaInfo = { remainingFraction = 0.965, resetTime = "2026-10-04T06:11:18Z" } },
+      },
+    }
+    local windows = p.parseModels(shared, ctx, { claude_gpt = true }, "model")
+    t.eq(#windows, 1, "shared pool collapses into one Gemini bucket")
+    t.eq(windows[1].id, "model:gemini")
+    t.eq(windows[1].label, "Gemini · Session")
+  end)
+
   t.test("expired token never spawns agy CLI to refresh", function()
     local host, p, ctx = env.provider("antigravity")
     host.commands.agy = true
