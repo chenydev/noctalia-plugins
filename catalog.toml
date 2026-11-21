@@ -4,8 +4,8 @@
 [[plugin]]
 id = "chenydev/headroom"
 name = "Headroom"
-version = "0.4.1"
-updated_at = 1795282299
+version = "0.4.2"
+updated_at = 1795282471
 added_at = 1795276152
 author = "chenydev"
 license = "MIT"

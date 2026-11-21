@@ -56,7 +56,11 @@ local function itemNodes(item, vertical: boolean, style: string, ringStyle: stri
   end
 
   local severity = view.severity(window, now)
-  if style ~= "value" then
+  local showRing = style == "full" or style == "ring"
+  local showPercent = style ~= "ring"
+  local badge = windowBadge(window)
+
+  if showRing then
     local percent = view.shownPercent(window)
     local color = theme.meterColor(severity)
     local opacity = if stale then 0.6 else 1
@@ -73,8 +77,16 @@ local function itemNodes(item, vertical: boolean, style: string, ringStyle: stri
         opacity = opacity,
       }))
     end
+  elseif style == "compact" and badge then
+    -- Compact style replaces the pie/ring gauge with the 5h / 7d window tag.
+    table.insert(nodes, ui.label({
+      text = badge,
+      fontSize = 11,
+      color = "on_surface_variant",
+      opacity = if stale or account.busy then 0.55 else 0.85,
+    }))
   end
-  if style ~= "ring" then
+  if showPercent then
     -- At the limit the percentage says nothing new; when you get it back does.
     local exhausted = window.limitReached and window.resetsAt ~= nil and window.resetsAt > now
     local text = if exhausted then time.duration(window.resetsAt - now)
@@ -86,16 +98,13 @@ local function itemNodes(item, vertical: boolean, style: string, ringStyle: stri
       fontWeight = if severity == "ok" then "medium" else "bold",
       opacity = if stale then 0.7 else 1,
     }))
-    if showBadge then
-      local badge = windowBadge(window)
-      if badge then
-        table.insert(nodes, ui.label({
-          text = badge,
-          fontSize = 10,
-          color = "on_surface_variant",
-          opacity = if stale then 0.55 else 0.8,
-        }))
-      end
+    if showBadge and style ~= "compact" and badge then
+      table.insert(nodes, ui.label({
+        text = badge,
+        fontSize = 10,
+        color = "on_surface_variant",
+        opacity = if stale then 0.55 else 0.8,
+      }))
     end
   end
   return nodes
@@ -165,7 +174,7 @@ local function render()
     return
   end
 
-  local style = state.config("bar_style", "full")
+  local style = state.config("bar_style", "compact")
   local ringStyle = state.config("ring_style", "filled")
   local showBadge = windowPref == "cycle"
   local container = if vertical then ui.column else ui.row

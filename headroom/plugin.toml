@@ -12,7 +12,7 @@
 
 id = "chenydev/headroom"
 name = "Headroom"
-version = "0.4.1"
+version = "0.4.2"
 plugin_api = 43
 author = "chenydev"
 license = "MIT"
@@ -172,8 +172,9 @@ entry = "bar.luau"
   type = "select"
   label_key = "settings.bar_style.label"
   description_key = "settings.bar_style.description"
-  default = "full"
+  default = "compact"
   options = [
+    { value = "compact", label_key = "settings.bar_style.option.compact" },
     { value = "full", label_key = "settings.bar_style.option.full" },
     { value = "value", label_key = "settings.bar_style.option.value" },
     { value = "ring", label_key = "settings.bar_style.option.ring" },
@@ -185,6 +186,7 @@ entry = "bar.luau"
   label_key = "settings.ring_style.label"
   description_key = "settings.ring_style.description"
   default = "filled"
+  visible_when = { key = "bar_style", values = ["full", "ring"] }
   options = [
     { value = "filled", label_key = "settings.ring_style.option.filled" },
     { value = "hollow", label_key = "settings.ring_style.option.hollow" },

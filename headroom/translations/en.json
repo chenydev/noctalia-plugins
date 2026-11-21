@@ -176,6 +176,7 @@
       "description": "What each item shows next to its logo.",
       "label": "Style",
       "option": {
+        "compact": "Compact (5h / 7d and percentage)",
         "full": "Ring and percentage",
         "ring": "Ring only",
         "value": "Percentage only"

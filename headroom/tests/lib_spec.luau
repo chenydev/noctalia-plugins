@@ -26,6 +26,7 @@ end)
 t.group("bar", function()
   t.test("draws the gauge in the widget's ring style", function()
     local host = env.host()
+    host.config.bar_style = "full"
     env.claudeCreds(host, "tok-a")
     env.serveClaude(host, { ["tok-a"] = "a" })
     env.start(host, "service.luau")
@@ -48,7 +49,7 @@ t.group("bar", function()
     t.eq(#env.find(host.barTree, filled), 1, "filled again")
   end)
 
-  t.test("alternates 5-hour and weekly windows in cycle mode with badges", function()
+  t.test("alternates 5-hour and weekly windows in compact cycle mode without pie/ring gauge", function()
     local host = env.host()
     host.config.window = "cycle"
     host.config.cycle_seconds = 8
@@ -63,12 +64,20 @@ t.group("bar", function()
         return node.type == "label" and node.props.text == text
       end) > 0
     end
+    local function hasGauge(): boolean
+      return #env.find(host.barTree, function(node)
+        return (node.type == "glyph" and node.props.name:match("^percentage%-"))
+          or (node.type == "image" and node.props.path:match("/rings/ring%-"))
+      end) > 0
+    end
 
+    t.eq(hasGauge(), false, "compact mode omits pie/ring gauge")
     t.ok(hasLabel("5h"), "shows 5h badge on even cycle slot")
     t.eq(hasLabel("7d"), false)
 
     host.clock += 8 -- odd -> weekly
     bar.call("update")
+    t.eq(hasGauge(), false, "still no gauge on weekly slot")
     t.ok(hasLabel("7d"), "switches to 7d badge after cycle_seconds")
     t.eq(hasLabel("5h"), false)
 
