@@ -43,13 +43,36 @@ enabled = true
 [[plugins.source]]
 name = "personal"
 kind = "path"
-location = "/home/chenyong/dev/projects/noctalia-plugins"
+location = "~/dev/projects/noctalia-plugins"
 enabled = true
 ```
 
-### 方式二：Git 仓库源（推送到 GitHub 后多机同步）
+### 方式二：Git 仓库源（推荐，多机同步）
 
-将 `kind` 改为 `"git"`、`location` 改为你的仓库地址即可（每次更新 `plugin.toml` 后运行 `python3 scripts/update-catalog.py` 刷新 `catalog.toml`）。
+```toml
+[plugins]
+enabled = ["chenydev/headroom"]
+
+[[plugins.source]]
+name = "official"
+kind = "git"
+location = "https://github.com/noctalia-dev/official-plugins"
+enabled = true
+
+[[plugins.source]]
+name = "community"
+kind = "git"
+location = "https://github.com/noctalia-dev/community-plugins"
+enabled = true
+
+[[plugins.source]]
+name = "chenydev"
+kind = "git"
+location = "https://github.com/chenydev/noctalia-plugins"
+enabled = true
+```
+
+每次更新 `plugin.toml` 后运行 `python3 scripts/update-catalog.py`（或推送到 `main` 由 GitHub Actions 自动刷新 `catalog.toml`）。
 
 Bar 组件配置：
 
