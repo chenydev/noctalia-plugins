@@ -14,8 +14,8 @@ local CONFIRM_SECONDS = 5
 local COPIED_SECONDS = 2
 -- Opening the panel fetches anything older than this, in the background.
 -- Long enough that opening it again and again adds no requests: the usage
--- endpoints throttle, and Claude's budget is shared with Claude Code.
-local OPEN_FRESHNESS = 120
+-- endpoints throttle, and Claude's budget is shared with Claude Code / T3 Code.
+local OPEN_FRESHNESS = 600
 
 local report = noctalia.state.get(state.REPORT)
 local isOpen = false
@@ -219,7 +219,8 @@ function onOpen(_context)
   report = noctalia.state.get(state.REPORT)
   panel.setWantsSecondTicks(true)
   render()
-  state.requestRefresh(OPEN_FRESHNESS)
+  local interval = if type(report) == "table" and type(report.interval) == "number" then report.interval else OPEN_FRESHNESS
+  state.requestRefresh(math.max(OPEN_FRESHNESS, interval))
 end
 
 function onClose()

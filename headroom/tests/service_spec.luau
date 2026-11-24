@@ -166,6 +166,29 @@ t.group("service", function()
     t.eq(#host.requests, before)
   end)
 
+  t.test("a single transient 429 keeps a fresh cached snapshot without showing an error banner", function()
+    local host = env.host()
+    claudeOnly(host)
+    host.config.refresh_minutes = 15
+    env.claudeCreds(host, "tok")
+    env.serveClaude(host, { tok = "a" })
+    local svc = env.start(host, "service.luau")
+    t.eq(env.account(host, "claude").phase, "ready")
+
+    -- Next scheduled poll hits 429: stays ready while cache is fresh, backs off.
+    env.serve(host, { ["/oauth/profile"] = "{}", ["/oauth/usage"] = { ok = true, status = 429, body = "" } })
+    env.advance(host, svc, 15 * 60)
+    local first = env.account(host, "claude")
+    t.eq(first.phase, "ready", "first transient 429 stays quiet with fresh cache")
+    t.eq(first.error, nil)
+
+    -- Second consecutive 429 surfaces the throttled banner.
+    env.advance(host, svc, 15 * 60)
+    local second = env.account(host, "claude")
+    t.eq(second.phase, "failing", "persistent 429 surfaces error")
+    t.eq(second.error.code, "rate_limited")
+  end)
+
   t.test("a long account name is cut on a character boundary", function()
     local host = env.host()
     claudeOnly(host)

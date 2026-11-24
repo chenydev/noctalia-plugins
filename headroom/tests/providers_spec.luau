@@ -71,6 +71,40 @@ t.group("claude", function()
     t.eq(#second.resetCredits, 2, "the last grants still shown")
   end)
 
+  t.test("falls back to plain usage endpoint when cedar_ember=1 is rate-limited", function()
+    local host, p, ctx = env.provider("claude")
+    env.claudeCreds(host, "tok-429")
+    env.serveClaude(host, { ["tok-429"] = "a" })
+    local serve = host.httpHandler
+    host.httpHandler = function(req)
+      if req.url:find("cedar_ember=1", 1, true) then
+        return { ok = true, status = 429, body = '{"error":{"type":"rate_limit_error"}}' }
+      end
+      return serve(req)
+    end
+    local snapshot, err = env.fetch(p, ctx)
+    t.eq(err, nil, "plain usage fallback succeeds")
+    t.ok(snapshot and #snapshot.windows > 0, "returns windows from plain endpoint")
+    t.eq(env.requestsTo(host, "cedar_ember=1"), 1, "tried grants endpoint once")
+    t.eq(env.requestsTo(host, "/oauth/usage"), 2, "fell back to plain usage endpoint")
+  end)
+
+  t.test("seeds grants cache from cachedSnapshot across restart to skip cedar_ember=1", function()
+    local host, p, ctx = env.provider("claude")
+    env.claudeCreds(host, "tok-seed")
+    env.serveClaude(host, { ["tok-seed"] = "a" })
+    ctx.cachedSnapshot = {
+      fetchedAt = host.clock - 600,
+      resetCredits = { { count = 1, label = "Saved credit", expiresAt = host.clock + 86400 } },
+      resetsUsable = 1,
+    }
+    local snapshot, err = env.fetch(p, ctx)
+    t.eq(err, nil)
+    t.eq(env.requestsTo(host, "cedar_ember=1"), 0, "skipped grants query while cached snapshot is fresh")
+    t.eq(#snapshot.resetCredits, 1, "preserved cached reset credits")
+    t.eq(snapshot.resetCredits[1].label, "Saved credit")
+  end)
+
   t.test("expired token never spawns claude CLI to refresh", function()
     local host, p, ctx = env.provider("claude")
     host.commands.claude = true

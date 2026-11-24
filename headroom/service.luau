@@ -93,7 +93,7 @@ local function isOff(id: string): boolean
 end
 
 local function intervalSeconds(): number
-  return math.clamp(state.config("refresh_minutes", 10), 1, 120) * 60
+  return math.clamp(state.config("refresh_minutes", 15), 1, 120) * 60
 end
 
 -- Every listed runtime, as a list taken now: callers may change the lists.
@@ -453,8 +453,19 @@ local function applyReply(rt: Runtime, snapshot: model.Snapshot?, err: model.Pro
     -- nothing to show, and not a problem to report.
     rt.phase, rt.error = "signed_out", nil
   elseif err then
-    rt.phase, rt.error = "failing", withHint(rt, err)
-    noctalia.log(`[headroom] {rt.account.key}: {err.code}{if err.detail then " (" .. err.detail .. ")" else ""}`)
+    -- A single transient 429 while we still have a fresh cached snapshot backs
+    -- off quietly in the scheduler instead of flashing a red Throttled banner.
+    local softThrottle = err.code == E.RateLimited
+      and rt.snapshot ~= nil
+      and rt.schedule.failures == 1
+      and (base.now() - rt.snapshot.fetchedAt) <= 2 * intervalSeconds()
+    if softThrottle then
+      rt.phase, rt.error = "ready", nil
+      noctalia.log(`[headroom] {rt.account.key}: {err.code}{if err.detail then " (" .. err.detail .. ")" else ""} (keeping fresh cache)`)
+    else
+      rt.phase, rt.error = "failing", withHint(rt, err)
+      noctalia.log(`[headroom] {rt.account.key}: {err.code}{if err.detail then " (" .. err.detail .. ")" else ""}`)
+    end
   else
     rt.phase, rt.error, rt.snapshot = "ready", nil, snapshot
     sendNotifications(rt)
@@ -502,7 +513,9 @@ local function fetchAccount(rt: Runtime, now: number)
     noctalia.log(`[headroom] {rt.account.key}: adapter error: {message}`)
     reply(nil, model.err(E.Parse, "adapter error"))
   end
-  local ok, thrown = pcall(rt.provider.fetch, guarded(rt.ctx, fail), reply)
+  local fetchCtx = guarded(rt.ctx, fail)
+  fetchCtx.cachedSnapshot = rt.snapshot
+  local ok, thrown = pcall(rt.provider.fetch, fetchCtx, reply)
   if not ok then
     fail(tostring(thrown))
   end

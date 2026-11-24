@@ -16,8 +16,9 @@
 -- Identity: GET https://api.anthropic.com/api/oauth/profile with the same
 -- token, once per token.
 --
--- Usage: GET https://api.anthropic.com/api/oauth/usage, at most hourly with
--- ?cedar_ember=1 for free limit resets.
+-- Usage: GET https://api.anthropic.com/api/oauth/usage, at most every 6 hours
+-- with ?cedar_ember=1 for free limit resets (falling back to the plain endpoint
+-- if the grants variant is rate-limited).
 
 local provider = require("../../lib/provider.luau")
 local renew = require("../../lib/renew.luau")
@@ -30,10 +31,10 @@ local USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 local PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 -- The reset grants come with the usage read at most this often: Anthropic
 -- throttles that variant harder than the plain read.
-local GRANTS_EVERY = 3600
+local GRANTS_EVERY = 6 * 3600
 -- Claude Code's version for the User-Agent until `claude --version` answers,
 -- or when Claude Code isn't installed.
-local KNOWN_VERSION = "2.1.322"
+local KNOWN_VERSION = "2.1.330"
 local CLAUDE_FALLBACKS = { "~/.local/bin/claude", "~/.claude/local/claude" }
 local SESSION_SECONDS = model.SESSION_SECONDS
 local WEEK_SECONDS = model.WEEK_SECONDS
@@ -301,28 +302,52 @@ return provider.define({
         ["User-Agent"] = userAgent(ctx),
       }
       local function usage(profile)
+        local now = ctx.now()
         local last = grants[key]
-        local withGrants = last == nil or last.token ~= oauth.accessToken or ctx.now() - last.at >= GRANTS_EVERY
+        -- Across a shell restart, seed the grants cache from the persisted
+        -- snapshot so the first poll does not immediately hit ?cedar_ember=1.
+        local cachedSnap = ctx.cachedSnapshot
+        if last == nil and type(cachedSnap) == "table" and type(cachedSnap.fetchedAt) == "number" and cachedSnap.resetCredits ~= nil and now - cachedSnap.fetchedAt < GRANTS_EVERY then
+          last = {
+            token = oauth.accessToken,
+            at = cachedSnap.fetchedAt,
+            list = cachedSnap.resetCredits,
+            usable = cachedSnap.resetsUsable,
+          }
+          grants[key] = last
+        end
+        local withGrants = last == nil or last.token ~= oauth.accessToken or now - last.at >= GRANTS_EVERY
         if withGrants then
           -- Answered or not, the next reads go without them for a while: a
           -- rejected variant must not cost the usage itself.
           local same = last and last.token == oauth.accessToken
-          last = { token = oauth.accessToken, at = ctx.now(), list = if same then last.list else nil, usable = if same then last.usable else nil }
+          last = { token = oauth.accessToken, at = now, list = if same then last.list else nil, usable = if same then last.usable else nil }
           grants[key] = last
         end
-        ctx.getJson(if withGrants then `{USAGE_URL}?cedar_ember=1` else USAGE_URL, headers, function(data, httpErr)
+        local function finishUsage(data, httpErr, usedGrants: boolean)
           if httpErr then
             done(nil, httpErr)
             return
           end
           local snapshot, parseErr = parse(data, profile, ctx)
-          if snapshot and withGrants then
+          if snapshot and usedGrants then
             last.list, last.usable = snapshot.resetCredits, snapshot.resetsUsable
           elseif snapshot then
             snapshot.resetCredits = model.resetCredits(last.list, ctx.now())
             snapshot.resetsUsable = last.usable
           end
           done(snapshot, parseErr)
+        end
+        ctx.getJson(if withGrants then `{USAGE_URL}?cedar_ember=1` else USAGE_URL, headers, function(data, httpErr)
+          if httpErr and withGrants and httpErr.code == E.RateLimited then
+            -- Fall back to the plain usage endpoint when the grants variant
+            -- hits Anthropic's tighter throttle bucket.
+            ctx.getJson(USAGE_URL, headers, function(plainData, plainErr)
+              finishUsage(plainData, plainErr, false)
+            end)
+            return
+          end
+          finishUsage(data, httpErr, withGrants)
         end)
       end
       local entry = known[key]

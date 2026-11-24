@@ -12,7 +12,7 @@
 
 id = "chenydev/headroom"
 name = "Headroom"
-version = "0.4.3"
+version = "0.4.4"
 plugin_api = 43
 author = "chenydev"
 license = "MIT"
@@ -121,7 +121,7 @@ key = "refresh_minutes"
 type = "int"
 label_key = "settings.refresh_minutes.label"
 description_key = "settings.refresh_minutes.description"
-default = 10
+default = 15
 min = 1
 max = 120
 
